@@ -170,8 +170,9 @@ dbt run --vars '{"my_variable": 1}'
   files with other templater settings (e.g. another dbt project); then that
   project's files report the error, and the other files are linted. When
   SQLFluff is used from several threads at once (e.g. through its Python
-  API), they can share one dbt project, but loading a different project
-  while another thread is rendering fails with an error.
+  API), they can share one dbt project. Using different dbt projects from
+  several threads at once isn't supported: depending on timing, one of
+  them fails with an error.
 - In SQLFluff 0.4.0 using the dbt templater requires that all files
   within the root and child directories of the dbt project must be part
   of the project. If there are deployment scripts which refer to SQL files
