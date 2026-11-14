@@ -1800,6 +1800,48 @@ def test__sequential_runner__sequence_error_per_file(tmp_path, stateful_events):
         )
 
 
+def test__sequential_runner__sequence_error_ignores_inline_groups(
+    tmp_path, stateful_events
+):
+    """Groups which only differ by inline config don't make errors per file.
+
+    So a templater which can't sequence its files stops the run, whether or
+    not inline config chose another instance for some of them.
+    """
+    fnames = [_stateful_file(tmp_path, "bad", index) for index in range(2)]
+    with open(fnames[1], "w", encoding="utf-8") as inline_file:
+        inline_file.write("-- sqlfluff:templater:stateful:key:y\nselect 1\n")
+    lntr = Linter(dialect="ansi")
+    with pytest.raises(SQLFluffUserError, match="bad key"):
+        list(runner.SequentialRunner(lntr, lntr.config).run(fnames, fix=False))
+
+
+def test__runner__skips_first_file_of_nested_templater(tmp_path):
+    """The first file of a nested templater's group may be skipped.
+
+    It isn't loaded to sequence the group, so the other files are linted.
+    """
+    tmp_path.joinpath(".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nlarge_file_skip_byte_limit = 100\n",
+        encoding="utf-8",
+    )
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    nested.joinpath(".sqlfluff").write_text(
+        "[sqlfluff]\ntemplater = placeholder\n\n"
+        "[sqlfluff:templater:placeholder]\nparam_style = colon\n",
+        encoding="utf-8",
+    )
+    big = nested / "big.sql"
+    big.write_text("select 1\n" + "-- pad\n" * 50, encoding="utf-8")
+    small = nested / "small.sql"
+    small.write_text("select :x\n", encoding="utf-8")
+    lntr = Linter(config=FluffConfig.from_path(str(tmp_path)))
+    for processes in (1, 2):
+        result = lntr.lint_paths((str(tmp_path),), processes=processes)
+        assert [linted.path for linted in result.paths[0].files] == [str(small)]
+
+
 def test__sequential_runner__skips_file_loaded_to_choose_templater(
     tmp_path, stateful_events
 ):
@@ -2214,3 +2256,30 @@ def test__linter__large_file_skip_fail_config(
     # But if large_file_skip_fail is set, the CLI would bump this to 1.
     would_fail = bool(result.files_skipped and config.get("large_file_skip_fail"))
     assert would_fail == expected_would_fail
+
+
+def test__linter__worker_templater_chosen_without_config_under_stateful_root(
+    tmp_path, stateful_events
+):
+    """Files of a nested worker templater aren't loaded to choose it.
+
+    Even if the root templater says how its state is shared, inline config
+    can't replace the nested templater.
+    """
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    nested.joinpath(".sqlfluff").write_text(
+        "[sqlfluff]\ntemplater = placeholder\n\n"
+        "[sqlfluff:templater:placeholder]\nparam_style = colon\n",
+        encoding="utf-8",
+    )
+    fname = str(nested / "0.sql")
+    lntr = Linter(
+        config=FluffConfig(
+            configs={"core": {"dialect": "ansi", "templater": "stateful"}}
+        )
+    )
+    root_file = _stateful_file(tmp_path, None)
+    with lntr._templater_session() as session:
+        assert lntr._templater_for_path(session, root_file) is None
+        assert lntr._templater_for_path(session, fname).name == "placeholder"

@@ -1164,16 +1164,17 @@ class Linter:
         """Choose the templater for a file without building its config, if possible.
 
         Returns what `_templater_for_config` would for the file, or None if
-        the file's config is needed to choose: if the root templater, or the
-        one set by nested config files, says how its state is shared, or if
-        the nested one renders in the main process.
+        the file's config is needed to choose: if the templater set by nested
+        config files (or else the root templater) says how its state is
+        shared, as inline config may change its key, or if the nested one
+        renders in the main process.
         """
         if not _selectable_by_nested_config(self.templater):
             return self.templater
-        if _shares_state_by_key(type(self.templater)):
-            return None
         name = self._nested_core_value(fname, "templater")
         if name is None:
+            if _shares_state_by_key(type(self.templater)):
+                return None
             return self.templater
         templater_class = self.config._templater_lookup().get(name)
         if (
@@ -1556,7 +1557,9 @@ class Linter:
                 raise prepared.error
             # Load the file with the config and yield the result.
             try:
-                raw_file, config, encoding = parse_runner._load(prepared)
+                raw_file, config, encoding = self.load_raw_file_and_config(
+                    prepared.fname, self.config
+                )
             except SQLFluffSkipFile as s:
                 linter_logger.warning(str(s))
                 continue
