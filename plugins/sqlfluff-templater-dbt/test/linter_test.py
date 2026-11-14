@@ -1,9 +1,10 @@
 """The Test file for the linter class."""
 
-import logging
 import os
 import os.path
 import shutil
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -12,7 +13,11 @@ from sqlfluff.core import FluffConfig, Linter
 from sqlfluff.core.linter import runner
 from sqlfluff.core.linter.common import DeferredRenderTask
 from sqlfluff.utils.testing.cli import invoke_assert_code
-from sqlfluff.utils.testing.logging import fluff_log_catcher
+
+
+def _write_config(path: Path, contents: str) -> None:
+    """Write a test configuration file."""
+    path.write_text(contents, encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -145,56 +150,243 @@ def test__dbt_linter__parallel_partials_path(project_dir, dbt_fluff_config):
     assert len(results) == 2
 
 
-def test__linter__nested_dbt_templater_ignored(tmp_path, project_dir, profiles_dir):
-    """The dbt templater can't be selected in a nested config.
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__dbt_linter__root_templater_reused(
+    set_relations_cache, project_dir, dbt_fluff_config
+):
+    """The root dbt templater renders files, and is reused across operations.
 
-    The file is rendered with the root templater, with a warning.
+    Its dbt project is only loaded once, and stays loaded until it's closed.
     """
-    nested = tmp_path / "nested"
-    nested.mkdir()
-    tmp_path.joinpath(".sqlfluff").write_text(
-        "[sqlfluff]\ndialect = postgres\ntemplater = jinja\n", encoding="utf-8"
+    from dbt.adapters.factory import FACTORY
+
+    lntr = Linter(config=FluffConfig(configs=dbt_fluff_config))
+    root_templater = lntr.templater
+    fname = os.path.join(
+        project_dir, "models/my_new_project/single_trailing_newline.sql"
     )
-    nested.joinpath(".sqlfluff").write_text(
-        "[sqlfluff]\ntemplater = dbt\n\n[sqlfluff:templater:dbt]\n"
-        f"project_dir = {os.path.abspath(project_dir)}\n"
-        f"profiles_dir = {os.path.abspath(profiles_dir)}\n",
+    with mock.patch.object(
+        root_templater, "process", wraps=root_templater.process
+    ) as process:
+        for _ in range(2):
+            result = lntr.lint_paths((fname,))
+            assert len(result.paths[0].files) == 1
+            assert lntr.templater is root_templater
+            assert set(FACTORY.adapters.values()) == {root_templater._adapter}
+    assert process.call_count == 2
+    # The manifest was loaded once, by the first operation.
+    manifest = root_templater.dbt_manifest
+    lntr.lint_paths((fname,))
+    assert root_templater.dbt_manifest is manifest
+    root_templater.close()
+    assert not FACTORY.adapters
+
+
+def _make_dbt_projects(tmp_path, dbt_project_folder):
+    """Make two dbt projects, nested in a project using the jinja templater.
+
+    Returns the root, a jinja file, the dbt files, and their rendered SQL.
+    """
+    root = tmp_path / "mixed_projects"
+    root.mkdir()
+    jinja_file = root / "jinja.sql"
+    jinja_file.write_text("select 1 from {{ table_name }}\n", encoding="utf-8")
+    _write_config(
+        root / ".sqlfluff",
+        """[sqlfluff]
+dialect = postgres
+templater = jinja
+
+[sqlfluff:templater:jinja:context]
+table_name = table_a
+""",
+    )
+
+    profiles_dir = Path(dbt_project_folder, "profiles_yml").resolve()
+    dbt_files = []
+    expected_rendered = {}
+    for project_index, project_name in enumerate(("project_a", "project_b"), start=1):
+        project_root = root / project_name
+        shutil.copytree(Path(dbt_project_folder, "dbt_project"), project_root)
+        _write_config(
+            project_root / ".sqlfluff",
+            f"""[sqlfluff]
+dialect = postgres
+templater = dbt
+
+[sqlfluff:templater:dbt]
+profiles_dir = {profiles_dir}
+project_dir = {project_root}
+
+[sqlfluff:templater:dbt:context]
+passed_through_cli = {project_index}
+""",
+        )
+        dbt_file = str(project_root / "models/vars_from_cli.sql")
+        dbt_files.append(dbt_file)
+        expected_rendered[dbt_file] = f"-- Issue #1262\nSELECT {project_index}\n"
+    return root, jinja_file, dbt_files, expected_rendered
+
+
+def _rendered_files(result):
+    """Return the templated SQL of each linted file, by path."""
+    return {
+        linted_file.path: linted_file.templated_file.templated_str
+        for linted_path in result.paths
+        for linted_file in linted_path.files
+    }
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__linter__supports_nested_dbt_projects(
+    set_relations_cache, tmp_path, dbt_project_folder, processes
+):
+    """Lint built-in and independent nested dbt templaters together."""
+    from dbt.adapters.factory import FACTORY
+
+    root, jinja_file, dbt_files, expected_rendered = _make_dbt_projects(
+        tmp_path, dbt_project_folder
+    )
+    linter = Linter(config=FluffConfig.from_path(str(root)))
+    result = linter.lint_paths(
+        (str(jinja_file), *dbt_files),
+        processes=processes,
+    )
+
+    assert not [violation for violation in result.get_violations() if violation.fatal]
+    assert _rendered_files(result) == {
+        str(jinja_file): "select 1 from table_a\n",
+        **expected_rendered,
+    }
+
+    reversed_result = linter.lint_paths(tuple(reversed(dbt_files)), processes=processes)
+    reversed_files = _rendered_files(reversed_result)
+    assert list(reversed_files) == list(reversed(dbt_files))
+    assert reversed_files == expected_rendered
+    # No dbt adapter is left registered.
+    assert not FACTORY.adapters
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__linter__dbt_inline_config_selects_project_config(
+    set_relations_cache, tmp_path, dbt_project_folder, processes
+):
+    """Inline config can change the dbt config of a file.
+
+    The file is rendered by another dbt templater, which loads the project
+    with the inline config, after the other files of the project.
+    """
+    root, _, dbt_files, expected_rendered = _make_dbt_projects(
+        tmp_path, dbt_project_folder
+    )
+    models = Path(dbt_files[0]).parent
+    inline_file = models / "inline_vars_from_cli.sql"
+    inline_file.write_text(
+        "-- sqlfluff:templater:dbt:context:passed_through_cli:7\n"
+        "SELECT {{ var('passed_through_cli') }}\n",
         encoding="utf-8",
     )
-    nested_file = nested / "query.sql"
-    nested_file.write_text("select {{ 1 }}\n", encoding="utf-8")
-    lntr = Linter(config=FluffConfig.from_path(str(tmp_path)))
-
-    with fluff_log_catcher(logging.WARNING, "sqlfluff.linter") as caplog:
-        rendered = lntr.render_file(str(nested_file), lntr.config)
-
-    assert "Attempt to set templater to dbt failed" in caplog.text
-    assert rendered.templated_variants[0].templated_str == "select 1\n"
-
-
-@pytest.mark.parametrize("nested_templater", ["jinja", "placeholder"])
-def test__linter__root_dbt_templater_used_for_nested_config(
-    nested_templater, project_dir, dbt_fluff_config
-):
-    """A root dbt templater renders files whose nested config sets another one.
-
-    The nested templater is ignored, with a warning.
-    """
-    lntr = Linter(config=FluffConfig(configs=dbt_fluff_config))
-    file_config = FluffConfig(
-        configs={
-            **dbt_fluff_config,
-            "core": {"templater": nested_templater, "dialect": "postgres"},
-        }
+    linter = Linter(config=FluffConfig.from_path(str(root)))
+    result = linter.lint_paths(
+        (dbt_files[0], str(inline_file), dbt_files[1]), processes=processes
     )
-    fname = os.path.join(project_dir, "models/depends_on_ephemeral/b.sql")
-    with open(fname) as f:
-        in_str = f.read()
 
-    with fluff_log_catcher(logging.WARNING, "sqlfluff.linter") as caplog:
-        rendered = lntr.render_string(in_str, fname, file_config, "utf-8")
+    assert not [violation for violation in result.get_violations() if violation.fatal]
+    assert _rendered_files(result) == {
+        **expected_rendered,
+        str(inline_file): (
+            "-- sqlfluff:templater:dbt:context:passed_through_cli:7\nSELECT 7\n"
+        ),
+    }
 
-    assert f"Attempt to set templater to {nested_templater} failed" in caplog.text
-    assert not rendered.templater_violations
-    # Only dbt can resolve the `ref()`.
-    assert "__dbt__cte__c" in rendered.templated_variants[0].templated_str
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__linter__parse_path_nested_dbt_projects(
+    set_relations_cache, tmp_path, dbt_project_folder
+):
+    """Parse files of several nested dbt projects."""
+    from dbt.adapters.factory import FACTORY
+
+    root, jinja_file, dbt_files, expected_rendered = _make_dbt_projects(
+        tmp_path, dbt_project_folder
+    )
+    linter = Linter(config=FluffConfig.from_path(str(root)))
+    parsed = {
+        parsed.fname: parsed
+        for parsed in linter.parse_path(str(root))
+        if parsed.fname in (str(jinja_file), *dbt_files)
+    }
+
+    assert len(parsed) == 3
+    for fname, parsed_file in parsed.items():
+        assert not [v for v in parsed_file.violations if v.rule_code() == "TMP"]
+        if fname in expected_rendered:
+            assert (
+                parsed_file.parsed_variants[0].templated_file.templated_str
+                == expected_rendered[fname]
+            )
+    assert not FACTORY.adapters
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__linter__root_dbt_templater_with_nested_dbt_project(
+    set_relations_cache, tmp_path, dbt_project_folder, assigned
+):
+    """A root dbt templater and a nested dbt templater lint files together.
+
+    Whichever templater renders a file loads its project, unloading the other.
+    """
+    from dbt.adapters.factory import FACTORY
+
+    _, _, dbt_files, expected_rendered = _make_dbt_projects(
+        tmp_path, dbt_project_folder
+    )
+    project_a = str(Path(dbt_files[0]).parents[1])
+    lntr = Linter(config=FluffConfig.from_path(project_a))
+    if assigned:
+        lntr.templater = FluffConfig.from_path(project_a).get_templater()
+    root_templater = lntr.templater
+
+    for files in (dbt_files, list(reversed(dbt_files))):
+        result = lntr.lint_paths(tuple(files))
+        assert not [v for v in result.get_violations() if v.fatal]
+        assert _rendered_files(result) == expected_rendered
+        assert lntr.templater is root_templater
+    # The nested templater was released, and the root one may stay loaded.
+    assert set(FACTORY.adapters.values()) <= {root_templater._adapter}
+    root_templater.close()
+    assert not FACTORY.adapters
+
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__dbt_linter__parallel_run_closed_early(
+    set_relations_cache, project_dir, dbt_fluff_config
+):
+    """A parallel run can be stopped early, and dbt can be loaded again.
+
+    The dbt project may be loaded in a pool thread, and unloaded in the main
+    thread.
+    """
+    from dbt.adapters.factory import FACTORY
+
+    from sqlfluff_templater_dbt import templater as dbt_templater_module
+
+    lntr = Linter(config=FluffConfig(configs=dbt_fluff_config))
+    fnames = [
+        os.path.join(project_dir, "models/my_new_project", name)
+        for name in ("single_trailing_newline.sql", "use_var.sql")
+    ]
+    parallel_runner, _ = runner.get_runner(lntr, lntr.config, processes=2)
+    linted = parallel_runner.run(fnames, fix=False)
+    next(linted)
+    linted.close()
+    lntr.templater.close()
+    assert not FACTORY.adapters
+
+    assert dbt_templater_module._ADAPTER_LOCK.acquire(timeout=10)
+    dbt_templater_module._ADAPTER_LOCK.release()
+    result = lntr.lint_paths(tuple(fnames))
+    assert len(_rendered_files(result)) == 2

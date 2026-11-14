@@ -9,9 +9,11 @@ such, all imports of the dbt libraries are contained within the
 DbtTemplater class and so are only imported when necessary.
 """
 
+import json
 import logging
 import os
 import os.path
+import threading
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -44,6 +46,14 @@ if TYPE_CHECKING:  # pragma: no cover
 
 # Instantiate the templater logger
 templater_logger = logging.getLogger("sqlfluff.templater")
+# dbt registers adapters in a process-wide factory, so only one dbt project
+# can be loaded at once. This is the templater whose project is loaded, if
+# any. A templater which loads its project unloads the owner's project first,
+# and the owner loads its project again if it's used again. The lock guards
+# the owner, and is only held while a project is loaded or unloaded, so it
+# may be taken by any thread.
+_adapter_owner: Optional["DbtTemplater"] = None
+_ADAPTER_LOCK = threading.Lock()
 
 
 @dataclass
@@ -173,7 +183,6 @@ class DbtTemplater(JinjaTemplater):
 
     name = "dbt"
     sequential_fail_limit = 3
-    adapters = {}
     # dbt builds a cross-file manifest in the main process, so templating
     # cannot be deferred to worker processes.
     templates_in_worker = False
@@ -185,11 +194,72 @@ class DbtTemplater(JinjaTemplater):
         self.profiles_dir = None
         self.working_dir = os.getcwd()
         self.dbt_skip_compilation_error = True
+        self._adapter = None
+        self._adapter_initialized = False
+        self._adapter_type = None
         super().__init__(override_context=override_context)
 
     def config_pairs(self):
         """Returns info about the given templater for output by the cli."""
         return [("templater", self.name), ("dbt", self.dbt_version)]
+
+    def session_key(self, config: "FluffConfig") -> tuple[str, ...]:
+        """Return a key for one effective dbt project configuration."""
+        return (
+            self.name,
+            self._get_project_dir(config),
+            self._get_profiles_dir(config),
+            repr(self._get_profile(config)),
+            repr(self._get_target(config)),
+            repr(self._get_target_path(config)),
+            repr(self._get_threads(config)),
+            json.dumps(
+                self._get_cli_vars(config), sort_keys=True, separators=(",", ":")
+            ),
+        )
+
+    def _release_adapter(self) -> None:
+        """Release this templater's adapter, if it has one.
+
+        Must be called with `_ADAPTER_LOCK` held. Adapters which other code
+        registered aren't touched.
+        """
+        global _adapter_owner
+        from dbt.adapters.factory import FACTORY
+
+        if _adapter_owner is self:
+            _adapter_owner = None
+        adapter, adapter_type = self._adapter, self._adapter_type
+        self._adapter = None
+        self._adapter_initialized = False
+        self._adapter_type = None
+        if adapter is None:
+            return
+        with FACTORY.lock:
+            if FACTORY.adapters.get(adapter_type) is adapter:
+                del FACTORY.adapters[adapter_type]
+        adapter.cleanup_connections()
+
+    def _unload_project(self) -> None:
+        """Release the adapter, and all other state for the dbt project.
+
+        Must be called with `_ADAPTER_LOCK` held.
+        """
+        self._release_adapter()
+        for name in (
+            "dbt_config",
+            "dbt_compiler",
+            "dbt_manifest",
+            "dbt_selector_method",
+        ):
+            self.__dict__.pop(name, None)
+        self.project_dir = None
+        self.profiles_dir = None
+
+    def close(self) -> None:
+        """Release the adapter, and all other state for the dbt project."""
+        with _ADAPTER_LOCK:
+            self._unload_project()
 
     @cached_property
     def _dbt_version(self) -> "VersionSpecifier":
@@ -248,54 +318,78 @@ class DbtTemplater(JinjaTemplater):
     def dbt_config(self):
         """Loads the dbt config."""
         from dbt import flags
-        from dbt.adapters.factory import register_adapter
+        from dbt.adapters.factory import FACTORY, register_adapter
         from dbt.config.runtime import RuntimeConfig as DbtRuntimeConfig
 
-        if self.dbt_version_tuple >= (1, 8):
-            from dbt_common.clients.system import get_env
-            from dbt_common.context import set_invocation_context
+        global _adapter_owner
+        with _ADAPTER_LOCK:
+            # Only one dbt project can be loaded at once.
+            if _adapter_owner is not None:
+                _adapter_owner._unload_project()
+            try:
+                with FACTORY.lock:
+                    if FACTORY.adapters:
+                        raise SQLFluffUserError(
+                            "dbt adapter is already in use by another operation."
+                        )
+                if self.dbt_version_tuple >= (1, 8):
+                    from dbt_common.clients.system import get_env
+                    from dbt_common.context import set_invocation_context
 
-            set_invocation_context(get_env())
+                    set_invocation_context(get_env())
 
-        # Attempt to silence internal logging at this point.
-        # https://github.com/sqlfluff/sqlfluff/issues/5054
-        self.try_silence_dbt_logs()
+                # Attempt to silence internal logging at this point.
+                # https://github.com/sqlfluff/sqlfluff/issues/5054
+                self.try_silence_dbt_logs()
 
-        user_config = None
-        # 1.5.x+ this is a dict.
-        cli_vars = self._get_cli_vars()
+                user_config = None
+                # 1.5.x+ this is a dict.
+                cli_vars = self._get_cli_vars()
+                _threads = self._get_threads()
+                flags.set_from_args(
+                    DbtConfigArgs(
+                        project_dir=self.project_dir,
+                        profiles_dir=self.profiles_dir,
+                        profile=self._get_profile(),
+                        target_path=self._get_target_path(),
+                        vars=cli_vars,
+                        threads=_threads,
+                    ),
+                    user_config,
+                )
+                _dbt_config = DbtRuntimeConfig.from_args(
+                    DbtConfigArgs(
+                        project_dir=self.project_dir,
+                        profiles_dir=self.profiles_dir,
+                        profile=self._get_profile(),
+                        target=self._get_target(),
+                        target_path=self._get_target_path(),
+                        vars=cli_vars,
+                        threads=_threads,
+                    )
+                )
+                self._adapter_type = _dbt_config.credentials.type
+                if self.dbt_version_tuple >= (1, 8):
+                    from dbt.mp_context import get_mp_context
 
-        _threads = self._get_threads()
-
-        flags.set_from_args(
-            DbtConfigArgs(
-                project_dir=self.project_dir,
-                profiles_dir=self.profiles_dir,
-                profile=self._get_profile(),
-                target_path=self._get_target_path(),
-                vars=cli_vars,
-                threads=_threads,
-            ),
-            user_config,
-        )
-        _dbt_config = DbtRuntimeConfig.from_args(
-            DbtConfigArgs(
-                project_dir=self.project_dir,
-                profiles_dir=self.profiles_dir,
-                profile=self._get_profile(),
-                target=self._get_target(),
-                target_path=self._get_target_path(),
-                vars=cli_vars,
-                threads=_threads,
-            )
-        )
-
-        if self.dbt_version_tuple >= (1, 8):
-            from dbt.mp_context import get_mp_context
-
-            register_adapter(_dbt_config, get_mp_context())
-        else:
-            register_adapter(_dbt_config)
+                    register_adapter(_dbt_config, get_mp_context())
+                else:
+                    register_adapter(_dbt_config)
+                registered_adapter = FACTORY.lookup_adapter(self._adapter_type)
+                if registered_adapter.config is not _dbt_config:
+                    raise SQLFluffUserError(
+                        "dbt adapter registration was claimed by another operation."
+                    )
+                self._adapter = registered_adapter
+                with FACTORY.lock:
+                    if set(FACTORY.adapters.values()) != {registered_adapter}:
+                        raise SQLFluffUserError(
+                            "Another dbt adapter was registered during SQLFluff startup."
+                        )
+            except BaseException:
+                self._release_adapter()
+                raise
+            _adapter_owner = self
 
         return _dbt_config
 
@@ -351,7 +445,7 @@ class DbtTemplater(JinjaTemplater):
 
         return _dbt_selector_method
 
-    def _get_profiles_dir(self):
+    def _get_profiles_dir(self, config=None):
         """Get the dbt profiles directory from the configuration.
 
         The default is `~/.dbt` but we use the
@@ -373,7 +467,9 @@ class DbtTemplater(JinjaTemplater):
 
         dbt_profiles_dir = os.path.abspath(
             os.path.expanduser(
-                self._get_dbt_config_value("profiles_dir", "PROFILES_DIR", default_dir)
+                self._get_dbt_config_value(
+                    "profiles_dir", "PROFILES_DIR", default_dir, config
+                )
             )
         )
 
@@ -386,7 +482,11 @@ class DbtTemplater(JinjaTemplater):
         return dbt_profiles_dir
 
     def _get_dbt_config_value(
-        self, config_key: str, env_var_suffix: str, default: Optional[str] = None
+        self,
+        config_key: str,
+        env_var_suffix: str,
+        default: Optional[str] = None,
+        config=None,
     ) -> Optional[str]:
         """Get a dbt config value from SQLFluff config or dbt env vars.
 
@@ -396,7 +496,7 @@ class DbtTemplater(JinjaTemplater):
         the legacy DBT_* variables for compatibility.
         """
         return (
-            self.sqlfluff_config.get_section(
+            (config or self.sqlfluff_config).get_section(
                 (self.templater_selector, self.name, config_key)
             )
             or os.getenv(f"DBT_ENGINE_{env_var_suffix}")
@@ -404,14 +504,16 @@ class DbtTemplater(JinjaTemplater):
             or default
         )
 
-    def _get_project_dir(self):
+    def _get_project_dir(self, config=None):
         """Get the dbt project directory from the configuration.
 
         Defaults to the working directory.
         """
         dbt_project_dir = os.path.abspath(
             os.path.expanduser(
-                self._get_dbt_config_value("project_dir", "PROJECT_DIR", os.getcwd())
+                self._get_dbt_config_value(
+                    "project_dir", "PROJECT_DIR", os.getcwd(), config
+                )
             )
         )
         if not os.path.exists(dbt_project_dir):
@@ -422,31 +524,31 @@ class DbtTemplater(JinjaTemplater):
 
         return dbt_project_dir
 
-    def _get_profile(self):
+    def _get_profile(self, config=None):
         """Get a dbt profile name from the configuration."""
-        return self._get_dbt_config_value("profile", "PROFILE")
+        return self._get_dbt_config_value("profile", "PROFILE", config=config)
 
-    def _get_target(self):
+    def _get_target(self, config=None):
         """Get a dbt target name from the configuration."""
-        return self._get_dbt_config_value("target", "TARGET")
+        return self._get_dbt_config_value("target", "TARGET", config=config)
 
-    def _get_target_path(self):
+    def _get_target_path(self, config=None):
         """Get a dbt target path from the configuration."""
-        return self._get_dbt_config_value("target_path", "TARGET_PATH")
+        return self._get_dbt_config_value("target_path", "TARGET_PATH", config=config)
 
-    def _get_threads(self) -> Optional[int]:
+    def _get_threads(self, config=None) -> Optional[int]:
         """Get the dbt threads value from the configuration.
 
         If not set, returns ``None`` which lets dbt use the value
         from ``profiles.yml``.
         """
-        value = self.sqlfluff_config.get_section(
+        value = (config or self.sqlfluff_config).get_section(
             (self.templater_selector, self.name, "threads")
         )
         return int(value) if value is not None else None
 
-    def _get_cli_vars(self) -> dict:
-        cli_vars = self.sqlfluff_config.get_section(
+    def _get_cli_vars(self, config=None) -> dict:
+        cli_vars = (config or self.sqlfluff_config).get_section(
             (self.templater_selector, self.name, "context")
         )
 
@@ -877,10 +979,9 @@ class DbtTemplater(JinjaTemplater):
         # We have to register the connection in dbt >= 1.0.0 ourselves
         # In previous versions, we relied on the functionality removed in
         # https://github.com/dbt-labs/dbt-core/pull/4062.
-        adapter = self.adapters.get(self.project_dir)
-        if adapter is None:
+        if not self._adapter_initialized:
+            # The adapter which this templater registered with its dbt config.
             adapter = get_adapter(self.dbt_config)
-            self.adapters[self.project_dir] = adapter
             adapter.acquire_connection("master")
             if self.dbt_version_tuple >= (1, 8):
                 # See notes from https://github.com/dbt-labs/dbt-adapters/discussions/87
@@ -892,6 +993,7 @@ class DbtTemplater(JinjaTemplater):
                 adapter.set_relations_cache(self.dbt_manifest.nodes.values())
             else:
                 adapter.set_relations_cache(self.dbt_manifest)
+            self._adapter_initialized = True
 
         yield
         # :TRICKY: Once connected, we never disconnect. Making multiple

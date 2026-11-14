@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from sqlfluff.core import FluffConfig
+from sqlfluff_templater_dbt import templater as dbt_templater_module
 from sqlfluff_templater_dbt.templater import DbtTemplater
 
 
@@ -28,6 +29,19 @@ def dbt_flags():
     # We've seen occasional runtime errors from that code:
     # TypeError: cannot pickle '_thread.RLock' object
     os.environ["DBT_USE_EXPERIMENTAL_PARSER"] = "True"
+
+
+@pytest.fixture(autouse=True)
+def unload_dbt_project():
+    """Unload any dbt project which a test left loaded.
+
+    Root templaters keep their project loaded across operations, so this
+    keeps tests from sharing dbt adapters.
+    """
+    yield
+    owner = dbt_templater_module._adapter_owner
+    if owner is not None:
+        owner.close()
 
 
 @pytest.fixture()
@@ -62,9 +76,11 @@ def profiles_dir(dbt_fluff_config):
 @pytest.fixture()
 def dbt_templater():
     """Returns an instance of the DbtTemplater."""
-    return FluffConfig(
+    templater = FluffConfig(
         overrides={"dialect": "ansi", "templater": "dbt"}
     ).get_templater()
+    yield templater
+    templater.close()
 
 
 @pytest.fixture(scope="session")

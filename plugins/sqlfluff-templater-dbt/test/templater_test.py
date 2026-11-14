@@ -18,7 +18,7 @@ from sqlfluff.core import FluffConfig, Lexer, Linter
 from sqlfluff.core.errors import SQLFluffSkipFile, SQLFluffUserError, SQLTemplaterError
 from sqlfluff.utils.testing.cli import invoke_assert_code
 from sqlfluff.utils.testing.logging import fluff_log_catcher
-from sqlfluff_templater_dbt.templater import DbtTemplater
+from sqlfluff_templater_dbt import templater as dbt_templater_module
 
 
 def test__templater_dbt_missing(dbt_templater, project_dir, dbt_fluff_config):
@@ -635,7 +635,7 @@ def test__templater_dbt_templating_absolute_path(
         ),
         pytest.param(
             "compile_missing_table.sql",
-            "Runtime Error",
+            'relation "this_table_does_not_exist" does not exist',
             False,
             SQLTemplaterError,
             id="dbt_skip_compilation_error",
@@ -729,7 +729,7 @@ def test__templater_dbt_handle_database_connection_failure(
             )
 
     # Clear the adapter cache to force this test to create a new connection.
-    DbtTemplater.adapters.clear()
+    dbt_templater.close()
 
     set_relations_cache.side_effect = DbtFailedToConnectException("dummy error")
 
@@ -762,6 +762,128 @@ def test__templater_dbt_handle_database_connection_failure(
     # NB: Replace slashes to deal with different platform paths being returned.
     error_message = excinfo.value.desc().replace("\\", "/")
     assert "dbt tried to connect to the database" in error_message
+
+
+def test__templater_dbt_session_key(dbt_templater, dbt_fluff_config):
+    """Configs share a dbt templater only if they configure the same state."""
+
+    def session_key(**dbt_config):
+        configs = deepcopy(dbt_fluff_config)
+        configs["templater"]["dbt"].update(dbt_config)
+        return dbt_templater.session_key(FluffConfig(configs=configs))
+
+    key = session_key()
+    assert session_key() == key
+    assert session_key(context={"passed_through_cli": 1}) != key
+    assert session_key(target="other") != key
+    assert session_key(threads=2) != key
+    assert session_key(context={"a": 1, "b": 2}) == session_key(
+        context={"b": 2, "a": 1}
+    )
+
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__templater_dbt_close_releases_adapter(
+    set_relations_cache, dbt_templater, dbt_fluff_config
+):
+    """Closing a dbt templater releases its adapter, so another can register.
+
+    Reading the templater's details for verbose output registers no adapter.
+    """
+    from dbt.adapters.factory import FACTORY
+
+    config = FluffConfig(configs=dbt_fluff_config)
+    assert dict(dbt_templater.config_pairs())["templater"] == "dbt"
+    assert not FACTORY.adapters
+
+    for _ in range(2):
+        dbt_templater.sqlfluff_config = config
+        dbt_templater.project_dir = dbt_templater._get_project_dir()
+        dbt_templater.profiles_dir = dbt_templater._get_profiles_dir()
+        with dbt_templater.connection():
+            adapter = dbt_templater._adapter
+            assert set(FACTORY.adapters.values()) == {adapter}
+        dbt_templater.close()
+        assert not FACTORY.adapters
+        assert dbt_templater._adapter is None
+        assert "dbt_config" not in dbt_templater.__dict__
+
+
+def test__templater_dbt_rejects_existing_adapter(dbt_templater):
+    """An existing dbt adapter prevents this session from claiming the factory."""
+    from dbt.adapters.factory import FACTORY
+
+    existing_adapter = mock.Mock()
+    with mock.patch.object(FACTORY, "adapters", {"postgres": existing_adapter}):
+        with pytest.raises(
+            SQLFluffUserError,
+            match="dbt adapter is already in use by another operation",
+        ):
+            _ = dbt_templater.dbt_config
+
+        assert FACTORY.adapters == {"postgres": existing_adapter}
+
+    assert dbt_templater._adapter is None
+    assert dbt_templater_module._adapter_owner is None
+
+
+@pytest.mark.parametrize(
+    "extra_adapter, error_message",
+    [
+        (False, "dbt adapter registration was claimed by another operation"),
+        (True, "Another dbt adapter was registered during SQLFluff startup"),
+    ],
+)
+def test__templater_dbt_rejects_adapter_registration_race(
+    dbt_templater, extra_adapter, error_message
+):
+    """A dbt adapter registration race is detected and cleaned up."""
+    from dbt.adapters.factory import FACTORY
+    from dbt.config.runtime import RuntimeConfig
+
+    dbt_config = mock.Mock()
+    dbt_config.credentials.type = "postgres"
+    registered_adapter = mock.Mock()
+    registered_adapter.config = (
+        dbt_config if extra_adapter else mock.sentinel.other_config
+    )
+    other_adapter = mock.Mock()
+
+    def register_adapter(*args):
+        FACTORY.adapters["postgres"] = registered_adapter
+        if extra_adapter:
+            FACTORY.adapters["other"] = other_adapter
+
+    dbt_templater.sqlfluff_config = FluffConfig(
+        configs={
+            "core": {"dialect": "postgres", "templater": "dbt"},
+            "templater": {
+                "dbt": {"project_dir": "/project", "profiles_dir": "/profiles"}
+            },
+        }
+    )
+    dbt_templater.project_dir = dbt_templater._get_project_dir()
+    dbt_templater.profiles_dir = dbt_templater._get_profiles_dir()
+    with (
+        mock.patch.object(FACTORY, "adapters", {}),
+        mock.patch.object(RuntimeConfig, "from_args", return_value=dbt_config),
+        mock.patch(
+            "dbt.adapters.factory.register_adapter", side_effect=register_adapter
+        ),
+        mock.patch.object(dbt_templater, "try_silence_dbt_logs"),
+    ):
+        with pytest.raises(SQLFluffUserError, match=error_message):
+            _ = dbt_templater.dbt_config
+
+        if extra_adapter:
+            assert FACTORY.adapters == {"other": other_adapter}
+            registered_adapter.cleanup_connections.assert_called_once_with()
+        else:
+            assert FACTORY.adapters == {"postgres": registered_adapter}
+            registered_adapter.cleanup_connections.assert_not_called()
+
+    assert dbt_templater._adapter is None
+    assert dbt_templater_module._adapter_owner is None
 
 
 def test__project_dir_from_env(dbt_templater, project_dir, monkeypatch):
@@ -991,3 +1113,55 @@ def test__templater_dbt_threads_explicit(dbt_templater):
         },
     )
     assert dbt_templater._get_threads() == 4
+
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__templater_dbt_project_loaded_and_closed_in_other_threads(
+    set_relations_cache, dbt_fluff_config
+):
+    """A dbt project loaded in one thread can be unloaded in another.
+
+    Loading another project unloads the loaded one, which loads again when
+    it's used again.
+    """
+    import threading
+
+    from dbt.adapters.factory import FACTORY
+
+    config = FluffConfig(configs=dbt_fluff_config)
+    first, second = config.get_templater(), config.get_templater()
+    for templater in (first, second):
+        templater.sqlfluff_config = config
+        templater.project_dir = templater._get_project_dir()
+        templater.profiles_dir = templater._get_profiles_dir()
+
+    loader = threading.Thread(target=lambda: first.dbt_config)
+    loader.start()
+    loader.join(timeout=120)
+    assert dbt_templater_module._adapter_owner is first
+    assert set(FACTORY.adapters.values()) == {first._adapter}
+
+    # The second templater unloads the first one's project.
+    with second.connection():
+        assert dbt_templater_module._adapter_owner is second
+        assert set(FACTORY.adapters.values()) == {second._adapter}
+    assert first._adapter is None
+    assert "dbt_config" not in first.__dict__
+
+    # Closed in another thread than the one which loaded it.
+    closer = threading.Thread(target=second.close)
+    closer.start()
+    closer.join(timeout=120)
+    assert dbt_templater_module._adapter_owner is None
+    assert not FACTORY.adapters
+    assert dbt_templater_module._ADAPTER_LOCK.acquire(timeout=10)
+    dbt_templater_module._ADAPTER_LOCK.release()
+
+    # The first templater loads its project again.
+    first.sqlfluff_config = config
+    first.project_dir = first._get_project_dir()
+    first.profiles_dir = first._get_profiles_dir()
+    with first.connection():
+        assert set(FACTORY.adapters.values()) == {first._adapter}
+    first.close()
+    assert not FACTORY.adapters
