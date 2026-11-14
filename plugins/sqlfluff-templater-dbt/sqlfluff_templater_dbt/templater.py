@@ -46,13 +46,29 @@ if TYPE_CHECKING:  # pragma: no cover
 
 # Instantiate the templater logger
 templater_logger = logging.getLogger("sqlfluff.templater")
-# dbt registers adapters in a process-wide factory, so only one dbt project
-# can be loaded at once. This is the templater whose project is loaded, if
-# any. A templater which loads its project unloads the owner's project first,
-# and the owner loads its project again if it's used again. The lock guards
-# the owner, and is only held while a project is loaded or unloaded, so it
-# may be taken by any thread.
-_adapter_owner: Optional["DbtTemplater"] = None
+
+
+class _LoadedProject:
+    """The dbt project which is loaded, and the templaters which use it.
+
+    dbt registers adapters in a process-wide factory, so only one dbt project
+    can be loaded at once. Templaters with the same `session_key` share it.
+    A templater which loads another project unloads it from each of its
+    users, unless one is rendering, and they load their project again if
+    they're used again.
+    """
+
+    def __init__(self) -> None:
+        self.key: Optional[tuple[str, ...]] = None
+        self.config: Any = None
+        # Keyed by `id()`, as templaters compare equal by their config.
+        self.users: dict[int, "DbtTemplater"] = {}
+
+
+_loaded_project = _LoadedProject()
+# Guards `_loaded_project`, and each templater's count of uses. It's only
+# held while a project is loaded or unloaded, so it may be taken by any
+# thread.
 _ADAPTER_LOCK = threading.Lock()
 
 
@@ -197,6 +213,8 @@ class DbtTemplater(JinjaTemplater):
         self._adapter = None
         self._adapter_initialized = False
         self._adapter_type = None
+        # How many renders (or sequencings) are using the loaded project.
+        self._uses = 0
         super().__init__(override_context=override_context)
 
     def config_pairs(self):
@@ -219,22 +237,23 @@ class DbtTemplater(JinjaTemplater):
         )
 
     def _release_adapter(self) -> None:
-        """Release this templater's adapter, if it has one.
+        """Stop using the loaded project's adapter, if this templater does.
 
-        Must be called with `_ADAPTER_LOCK` held. Adapters which other code
-        registered aren't touched.
+        The adapter is released once no templater uses it. Must be called
+        with `_ADAPTER_LOCK` held. Adapters which other code registered
+        aren't touched.
         """
-        global _adapter_owner
         from dbt.adapters.factory import FACTORY
 
-        if _adapter_owner is self:
-            _adapter_owner = None
+        _loaded_project.users.pop(id(self), None)
         adapter, adapter_type = self._adapter, self._adapter_type
         self._adapter = None
         self._adapter_initialized = False
         self._adapter_type = None
-        if adapter is None:
+        if adapter is None or _loaded_project.users:
             return
+        _loaded_project.key = None
+        _loaded_project.config = None
         with FACTORY.lock:
             if FACTORY.adapters.get(adapter_type) is adapter:
                 del FACTORY.adapters[adapter_type]
@@ -260,6 +279,48 @@ class DbtTemplater(JinjaTemplater):
         """Release the adapter, and all other state for the dbt project."""
         with _ADAPTER_LOCK:
             self._unload_project()
+
+    def _set_invocation_context(self) -> None:
+        """Set dbt's invocation context for this thread."""
+        if self.dbt_version_tuple >= (1, 8):
+            from dbt_common.clients.system import get_env
+            from dbt_common.context import set_invocation_context
+
+            set_invocation_context(get_env())
+
+    @contextmanager
+    def _in_use(self) -> Iterator[None]:
+        """Mark the loaded project as in use, so it isn't unloaded meanwhile."""
+        with _ADAPTER_LOCK:
+            self._uses += 1
+        try:
+            yield
+        finally:
+            with _ADAPTER_LOCK:
+                self._uses -= 1
+
+    def _share_loaded_project(self) -> bool:
+        """Use the loaded project, if it's the one this templater would load.
+
+        Otherwise unload it from its users. Must be called with
+        `_ADAPTER_LOCK` held.
+        """
+        users = [user for user in _loaded_project.users.values() if user is not self]
+        key = self.session_key(self.sqlfluff_config) if self.sqlfluff_config else None
+        if users and key is not None and key == _loaded_project.key:
+            self._adapter = users[0]._adapter
+            self._adapter_type = users[0]._adapter_type
+            _loaded_project.users[id(self)] = self
+            return True
+        if any(user._uses for user in users):
+            raise SQLFluffUserError(
+                "Another dbt project is being rendered by another operation. "
+                "SQLFluff can only load one dbt project at a time."
+            )
+        for user in users:
+            user._unload_project()
+        _loaded_project.key = key
+        return False
 
     @cached_property
     def _dbt_version(self) -> "VersionSpecifier":
@@ -321,23 +382,18 @@ class DbtTemplater(JinjaTemplater):
         from dbt.adapters.factory import FACTORY, register_adapter
         from dbt.config.runtime import RuntimeConfig as DbtRuntimeConfig
 
-        global _adapter_owner
+        # dbt reads this context from each thread which uses the project.
+        self._set_invocation_context()
         with _ADAPTER_LOCK:
             # Only one dbt project can be loaded at once.
-            if _adapter_owner is not None:
-                _adapter_owner._unload_project()
+            if self._share_loaded_project():
+                return _loaded_project.config
             try:
                 with FACTORY.lock:
                     if FACTORY.adapters:
                         raise SQLFluffUserError(
                             "dbt adapter is already in use by another operation."
                         )
-                if self.dbt_version_tuple >= (1, 8):
-                    from dbt_common.clients.system import get_env
-                    from dbt_common.context import set_invocation_context
-
-                    set_invocation_context(get_env())
-
                 # Attempt to silence internal logging at this point.
                 # https://github.com/sqlfluff/sqlfluff/issues/5054
                 self.try_silence_dbt_logs()
@@ -388,8 +444,10 @@ class DbtTemplater(JinjaTemplater):
                         )
             except BaseException:
                 self._release_adapter()
+                _loaded_project.key = None
                 raise
-            _adapter_owner = self
+            _loaded_project.config = _dbt_config
+            _loaded_project.users[id(self)] = self
 
         return _dbt_config
 
@@ -589,14 +647,16 @@ class DbtTemplater(JinjaTemplater):
         ephemeral_nodes: dict[str, tuple[str, Any]] = {}
 
         # Extract the ephemeral models
-        for key, node in self.dbt_manifest.nodes.items():
-            if node.config.materialized == "ephemeral":
-                # The key is the full filepath.
-                # The value tuple, with the filepath and a list of dependent keys
-                ephemeral_nodes[key] = (
-                    os.path.join(self.project_dir, node.original_file_path),
-                    node.depends_on.nodes,
-                )
+        with self._in_use():
+            for key, node in self.dbt_manifest.nodes.items():
+                if node.config.materialized == "ephemeral":
+                    # The key is the full filepath.
+                    # The value tuple, with the filepath and a list of
+                    # dependent keys.
+                    ephemeral_nodes[key] = (
+                        os.path.join(self.project_dir, node.original_file_path),
+                        node.depends_on.nodes,
+                    )
 
         # Yield ephemeral nodes first. We use a deque for efficient re-queuing.
         # We iterate through the deque, yielding any nodes without dependents,
@@ -668,9 +728,10 @@ class DbtTemplater(JinjaTemplater):
 
         # NOTE: dbt exceptions are caught and handled safely for pickling by the outer
         # `handle_dbt_errors` decorator.
-        return self._unsafe_process(
-            fname_absolute_path, in_str, config, self.project_dir
-        )
+        with self._in_use():
+            return self._unsafe_process(
+                fname_absolute_path, in_str, config, self.project_dir
+            )
 
     def _find_node(self, fname, config=None, dbt_dir=os.getcwd()):
         if not config:  # pragma: no cover

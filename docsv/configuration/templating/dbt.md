@@ -165,7 +165,13 @@ dbt run --vars '{"my_variable": 1}'
   time: loading another releases the loaded project and its dbt adapter, and
   that project is loaded again if it's used again. Inline config which
   changes `[sqlfluff:templater:dbt]` settings, such as `context` values,
-  loads the project with those settings to render that file.
+  loads the project with those settings to render that file. If a dbt
+  project can't be compiled, the run stops, unless the run also includes
+  files with other templater settings (e.g. another dbt project); then that
+  project's files report the error, and the other files are linted. When
+  SQLFluff is used from several threads at once (e.g. through its Python
+  API), they can share one dbt project, but loading a different project
+  while another thread is rendering fails with an error.
 - In SQLFluff 0.4.0 using the dbt templater requires that all files
   within the root and child directories of the dbt project must be part
   of the project. If there are deployment scripts which refer to SQL files

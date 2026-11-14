@@ -824,7 +824,7 @@ def test__templater_dbt_rejects_existing_adapter(dbt_templater):
         assert FACTORY.adapters == {"postgres": existing_adapter}
 
     assert dbt_templater._adapter is None
-    assert dbt_templater_module._adapter_owner is None
+    assert not _loaded_users()
 
 
 @pytest.mark.parametrize(
@@ -883,7 +883,7 @@ def test__templater_dbt_rejects_adapter_registration_race(
             registered_adapter.cleanup_connections.assert_not_called()
 
     assert dbt_templater._adapter is None
-    assert dbt_templater_module._adapter_owner is None
+    assert not _loaded_users()
 
 
 def test__project_dir_from_env(dbt_templater, project_dir, monkeypatch):
@@ -1129,21 +1129,21 @@ def test__templater_dbt_project_loaded_and_closed_in_other_threads(
     from dbt.adapters.factory import FACTORY
 
     config = FluffConfig(configs=dbt_fluff_config)
+    # Another configuration of the project, which dbt loads separately.
+    other_config = _with_dbt_threads(dbt_fluff_config, 2)
     first, second = config.get_templater(), config.get_templater()
-    for templater in (first, second):
-        templater.sqlfluff_config = config
-        templater.project_dir = templater._get_project_dir()
-        templater.profiles_dir = templater._get_profiles_dir()
+    for templater, templater_config in ((first, config), (second, other_config)):
+        _prepare(templater, templater_config)
 
     loader = threading.Thread(target=lambda: first.dbt_config)
     loader.start()
     loader.join(timeout=120)
-    assert dbt_templater_module._adapter_owner is first
+    assert _loaded_users() == [id(first)]
     assert set(FACTORY.adapters.values()) == {first._adapter}
 
     # The second templater unloads the first one's project.
     with second.connection():
-        assert dbt_templater_module._adapter_owner is second
+        assert _loaded_users() == [id(second)]
         assert set(FACTORY.adapters.values()) == {second._adapter}
     assert first._adapter is None
     assert "dbt_config" not in first.__dict__
@@ -1152,16 +1152,82 @@ def test__templater_dbt_project_loaded_and_closed_in_other_threads(
     closer = threading.Thread(target=second.close)
     closer.start()
     closer.join(timeout=120)
-    assert dbt_templater_module._adapter_owner is None
+    assert not _loaded_users()
     assert not FACTORY.adapters
     assert dbt_templater_module._ADAPTER_LOCK.acquire(timeout=10)
     dbt_templater_module._ADAPTER_LOCK.release()
 
     # The first templater loads its project again.
-    first.sqlfluff_config = config
-    first.project_dir = first._get_project_dir()
-    first.profiles_dir = first._get_profiles_dir()
+    _prepare(first, config)
     with first.connection():
         assert set(FACTORY.adapters.values()) == {first._adapter}
     first.close()
     assert not FACTORY.adapters
+
+
+def _with_dbt_threads(dbt_fluff_config, threads):
+    """Return a config for the dbt project, with another `threads` value."""
+    configs = deepcopy(dbt_fluff_config)
+    configs["templater"]["dbt"]["threads"] = threads
+    return FluffConfig(configs=configs)
+
+
+def _prepare(templater, config):
+    """Configure a dbt templater, as sequencing or rendering a file does."""
+    templater.sqlfluff_config = config
+    templater.project_dir = templater._get_project_dir()
+    templater.profiles_dir = templater._get_profiles_dir()
+
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__templater_dbt_same_project_shared(set_relations_cache, dbt_fluff_config):
+    """Templaters for the same dbt project config share the loaded project.
+
+    It stays loaded until neither uses it.
+    """
+    from dbt.adapters.factory import FACTORY
+
+    config = FluffConfig(configs=dbt_fluff_config)
+    first, second = config.get_templater(), config.get_templater()
+    for templater in (first, second):
+        _prepare(templater, config)
+    with first.connection():
+        pass
+    with second.connection():
+        assert _loaded_users() == [id(first), id(second)]
+        assert second._adapter is first._adapter
+        assert set(FACTORY.adapters.values()) == {first._adapter}
+    assert "dbt_config" in first.__dict__
+
+    first.close()
+    assert set(FACTORY.adapters.values()) == {second._adapter}
+    second.close()
+    assert not FACTORY.adapters
+
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__templater_dbt_project_in_use_not_unloaded(
+    set_relations_cache, dbt_fluff_config
+):
+    """A project which is in use isn't unloaded to load another one."""
+    from dbt.adapters.factory import FACTORY
+
+    first = FluffConfig(configs=dbt_fluff_config).get_templater()
+    second = FluffConfig(configs=dbt_fluff_config).get_templater()
+    _prepare(first, FluffConfig(configs=dbt_fluff_config))
+    _prepare(second, _with_dbt_threads(dbt_fluff_config, 2))
+    with first.connection(), first._in_use():
+        with pytest.raises(
+            SQLFluffUserError, match="SQLFluff can only load one dbt project"
+        ):
+            _ = second.dbt_config
+        assert _loaded_users() == [id(first)]
+        assert set(FACTORY.adapters.values()) == {first._adapter}
+    assert second._adapter is None
+    first.close()
+    assert not FACTORY.adapters
+
+
+def _loaded_users():
+    """The ids of the templaters using the loaded dbt project."""
+    return list(dbt_templater_module._loaded_project.users)

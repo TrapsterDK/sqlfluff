@@ -39,9 +39,8 @@ def unload_dbt_project():
     keeps tests from sharing dbt adapters.
     """
     yield
-    owner = dbt_templater_module._adapter_owner
-    if owner is not None:
-        owner.close()
+    for templater in list(dbt_templater_module._loaded_project.users.values()):
+        templater.close()
 
 
 @pytest.fixture()

@@ -390,3 +390,38 @@ def test__dbt_linter__parallel_run_closed_early(
     dbt_templater_module._ADAPTER_LOCK.release()
     result = lntr.lint_paths(tuple(fnames))
     assert len(_rendered_files(result)) == 2
+
+
+@mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
+def test__dbt_linter__same_project_in_threads(
+    set_relations_cache, project_dir, dbt_fluff_config
+):
+    """Linters in several threads can lint the same dbt project at once."""
+    import threading
+
+    fnames = tuple(
+        os.path.join(project_dir, "models/my_new_project", name)
+        for name in ("single_trailing_newline.sql", "use_var.sql", "AM03_test.sql")
+    )
+    linters = [Linter(config=FluffConfig(configs=dbt_fluff_config)) for _ in range(2)]
+    results = {}
+    errors = []
+
+    def lint(index):
+        try:
+            results[index] = linters[index].lint_paths(fnames)
+        except Exception as err:  # pragma: no cover
+            errors.append(err)
+
+    threads = [threading.Thread(target=lint, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=300)
+
+    assert not errors
+    for result in results.values():
+        assert len(_rendered_files(result)) == 3
+        assert not [v for v in result.get_violations() if v.rule_code() == "TMP"]
+    for linter in linters:
+        linter.templater.close()
