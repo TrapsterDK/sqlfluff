@@ -29,7 +29,7 @@ from sqlfluff.core import FluffConfig, Linter
 from sqlfluff.core.errors import SQLFluffSkipFile, SQLFluffUserError, SQLTemplaterError
 from sqlfluff.core.linter import LintedFile, RenderedFile
 from sqlfluff.core.linter.common import DeferredRenderTask
-from sqlfluff.core.linter.linter import _selectable_by_nested_config
+from sqlfluff.core.linter.linter import _selectable_by_nested_config, _TemplaterSession
 from sqlfluff.core.plugin.host import is_main_process
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -49,6 +49,12 @@ class _PreparedFile(NamedTuple):
     # Set if the templater failed to sequence its files, e.g. as its dbt
     # project doesn't compile. The file then reports that error.
     error: Optional[SQLFluffUserError] = None
+    # Whether the templater was chosen by the file's config without its
+    # inline config, so must be checked once the file is loaded.
+    check_key: bool = False
+    # The file's text, config (with inline config) and encoding, if it was
+    # loaded before rendering.
+    loaded: Optional[tuple[str, FluffConfig, str]] = None
 
 
 class _WorkerState(NamedTuple):
@@ -96,15 +102,19 @@ class BaseRunner(ABC):
         first file, and only one such templater holds its state at once.
         Each templater created for the operation is released after its last
         file.
+
+        If a templater's state is chosen by its config (e.g. the dbt project),
+        files are grouped by their config without inline config, so that each
+        is only read once, to render it. A file whose inline config chooses
+        other state is then deferred, and rendered once all groups are done,
+        with the other deferred files which share its state.
         """
         with self.linter._templater_session() as session:
             groups: dict[int, list[tuple[int, _PreparedFile]]] = {}
             # The templater for the files in each directory, if it can be
-            # chosen without their configs. Otherwise each file is loaded
-            # here, to apply its inline config, and loaded again to render
-            # it, so that its text isn't held meanwhile.
+            # chosen without their configs.
             templater_by_dir: dict[str, Optional["RawTemplater"]] = {}
-            # The config of the first file of each group, if it was loaded.
+            # The config of the first file of each group, if it was built.
             first_configs: dict[int, FluffConfig] = {}
             for index, fname in enumerate(fnames):
                 dirname = os.path.dirname(fname)
@@ -113,25 +123,23 @@ class BaseRunner(ABC):
                         session, fname
                     )
                 templater = templater_by_dir[dirname]
+                check_key = templater is None
                 if templater is None:
-                    try:
-                        _, file_config, _ = self.linter.load_raw_file_and_config(
-                            fname, self.config
-                        )
-                    except SQLFluffSkipFile as skip_file_err:
-                        self._skip(skip_file_err)
-                        continue
+                    path_config = self.config.make_child_from_path(
+                        fname, require_dialect=False
+                    )
                     # Any warning is logged when the file is rendered.
                     templater = self.linter._templater_for_config(
-                        session, file_config, fname, warn=False
+                        session, path_config, fname, warn=False
                     )
-                    first_configs.setdefault(id(templater), file_config)
+                    first_configs.setdefault(id(templater), path_config)
                 groups.setdefault(id(templater), []).append(
-                    (index, _PreparedFile(fname, templater))
+                    (index, _PreparedFile(fname, templater, check_key=check_key))
                 )
             # The templater, and the files it renders, at each place in
             # discovery order.
             places: dict[int, tuple["RawTemplater", Iterator[_PreparedFile]]] = {}
+            deferred: list[_PreparedFile] = []
             for group in groups.values():
                 templater = group[0][1].templater
                 sequenced = self._sequenced(
@@ -144,7 +152,10 @@ class BaseRunner(ABC):
                     for (index, _), prepared in zip(group, sequenced):
                         places[index] = (templater, iter((prepared,)))
                 else:
-                    places[group[0][0]] = (templater, sequenced)
+                    places[group[0][0]] = (
+                        templater,
+                        self._checked(session, sequenced, deferred),
+                    )
             last_places = {
                 id(templater): index for index, (templater, _) in sorted(places.items())
             }
@@ -152,6 +163,69 @@ class BaseRunner(ABC):
                 yield from prepared_files
                 if last_places[id(templater)] == index:
                     session.release(templater)
+            yield from self._iter_deferred(
+                session, deferred, formatter, list(groups.values())
+            )
+
+    def _checked(
+        self,
+        session: _TemplaterSession,
+        prepared_files: Iterator[_PreparedFile],
+        deferred: list[_PreparedFile],
+    ) -> Iterator[_PreparedFile]:
+        """Load files whose templater must be checked, and check it.
+
+        Each file is loaded when it's needed, to apply its inline config. If
+        that chooses another templater (e.g. for another dbt project), the
+        file is added to `deferred` with its loaded text and config, rather
+        than rendered now.
+        """
+        for prepared in prepared_files:
+            if not prepared.check_key:
+                yield prepared
+                continue
+            try:
+                loaded = self.linter.load_raw_file_and_config(
+                    prepared.fname, self.config
+                )
+            except SQLFluffSkipFile as skip_file_err:
+                self._skip(skip_file_err)
+                continue
+            templater = self.linter._templater_for_config(
+                session, loaded[1], prepared.fname, warn=False
+            )
+            if templater is prepared.templater:
+                yield prepared._replace(loaded=loaded)
+            else:
+                deferred.append(_PreparedFile(prepared.fname, templater, loaded=loaded))
+
+    def _iter_deferred(
+        self,
+        session: _TemplaterSession,
+        deferred: list[_PreparedFile],
+        formatter: Optional["FormatterInterface"],
+        groups: list[list[tuple[int, _PreparedFile]]],
+    ) -> Iterator[_PreparedFile]:
+        """Iterate through deferred files, grouped by templater.
+
+        Each templater is chosen again, as the one chosen when the file was
+        deferred may have been released since. It's released after its
+        group's last file.
+        """
+        deferred_groups: dict[int, list[tuple[int, _PreparedFile]]] = {}
+        for index, prepared in enumerate(deferred):
+            assert prepared.loaded
+            templater = self.linter._templater_for_config(
+                session, prepared.loaded[1], prepared.fname, warn=False
+            )
+            deferred_groups.setdefault(id(templater), []).append(
+                (index, prepared._replace(templater=templater))
+            )
+        for group in deferred_groups.values():
+            first = group[0][1]
+            assert first.loaded
+            yield from self._sequenced(group, formatter, groups, first.loaded[1])
+            session.release(first.templater)
 
     def _sequenced(
         self,
@@ -171,7 +245,7 @@ class BaseRunner(ABC):
         templater = first.templater
         # The root templater is sequenced with the root config, and others
         # with the config of their first file: with its inline config if it
-        # was loaded to choose the templater, or else from its path.
+        # was deferred, or else from its path.
         sequence_config = self.config
         if templater is not self.linter.templater:
             sequence_config = first_config or self.config.make_child_from_path(
@@ -215,12 +289,16 @@ class BaseRunner(ABC):
         linter_logger.warning(str(skip_file_err))
         self.skipped_file_count += 1
 
+    def _load(self, prepared: _PreparedFile) -> tuple[str, FluffConfig, str]:
+        """Load a file, unless it was loaded already."""
+        if prepared.loaded:
+            return prepared.loaded
+        return self.linter.load_raw_file_and_config(prepared.fname, self.config)
+
     def _render(self, prepared: _PreparedFile) -> Optional[RenderedFile]:
         """Render a file, or return None if it's skipped."""
         try:
-            raw_file, config, encoding = self.linter.load_raw_file_and_config(
-                prepared.fname, self.config
-            )
+            raw_file, config, encoding = self._load(prepared)
             if prepared.error:
                 return RenderedFile(
                     [],

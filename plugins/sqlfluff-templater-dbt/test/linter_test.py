@@ -271,13 +271,16 @@ def test__linter__supports_nested_dbt_projects(
 @pytest.mark.parametrize("processes", [1, 2])
 @mock.patch("dbt.adapters.postgres.impl.PostgresAdapter.set_relations_cache")
 def test__linter__dbt_inline_config_selects_project_config(
-    set_relations_cache, tmp_path, dbt_project_folder, processes
+    set_relations_cache, tmp_path, dbt_project_folder, processes, monkeypatch
 ):
     """Inline config can change the dbt config of a file.
 
-    The file is rendered by another dbt templater, which loads the project
-    with the inline config, after the other files of the project.
+    The file is deferred, and rendered by another dbt templater, which loads
+    the project with the inline config, after the other files. Each file is
+    read once.
     """
+    from sqlfluff_templater_dbt.templater import DbtTemplater
+
     root, _, dbt_files, expected_rendered = _make_dbt_projects(
         tmp_path, dbt_project_folder
     )
@@ -288,12 +291,30 @@ def test__linter__dbt_inline_config_selects_project_config(
         "SELECT {{ var('passed_through_cli') }}\n",
         encoding="utf-8",
     )
+    reads = []
+    load_raw_file = Linter._load_raw_file
+
+    def record_read(fname, file_config):
+        reads.append(fname)
+        return load_raw_file(fname, file_config)
+
+    renders = []
+    process = DbtTemplater.process
+
+    def record_render(self, **kwargs):
+        renders.append(kwargs["fname"])
+        return process(self, **kwargs)
+
+    monkeypatch.setattr(Linter, "_load_raw_file", staticmethod(record_read))
+    monkeypatch.setattr(DbtTemplater, "process", record_render)
     linter = Linter(config=FluffConfig.from_path(str(root)))
     result = linter.lint_paths(
         (dbt_files[0], str(inline_file), dbt_files[1]), processes=processes
     )
 
     assert not [violation for violation in result.get_violations() if violation.fatal]
+    assert sorted(reads) == sorted((*dbt_files, str(inline_file)))
+    assert renders[-1] == str(inline_file)
     assert _rendered_files(result) == {
         **expected_rendered,
         str(inline_file): (

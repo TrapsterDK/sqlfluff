@@ -1557,9 +1557,7 @@ class Linter:
                 raise prepared.error
             # Load the file with the config and yield the result.
             try:
-                raw_file, config, encoding = self.load_raw_file_and_config(
-                    prepared.fname, self.config
-                )
+                raw_file, config, encoding = parse_runner._load(prepared)
             except SQLFluffSkipFile as s:
                 linter_logger.warning(str(s))
                 continue

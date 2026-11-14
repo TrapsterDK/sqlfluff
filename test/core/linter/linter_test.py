@@ -1845,7 +1845,10 @@ def test__runner__skips_first_file_of_nested_templater(tmp_path):
 def test__sequential_runner__skips_file_loaded_to_choose_templater(
     tmp_path, stateful_events
 ):
-    """A file loaded to choose its templater may be skipped."""
+    """A file loaded to check its templater may be skipped.
+
+    Its templater is released without rendering anything.
+    """
     fname = _stateful_file(tmp_path, "x")
     (tmp_path / "x" / ".sqlfluff").write_text(
         "[sqlfluff]\ntemplater = stateful\nlarge_file_skip_byte_limit = 1\n",
@@ -1855,7 +1858,76 @@ def test__sequential_runner__skips_file_loaded_to_choose_templater(
     sequential_runner = runner.SequentialRunner(lntr, lntr.config)
     assert not list(sequential_runner.run([fname], fix=False))
     assert sequential_runner.skipped_file_count == 1
-    assert not stateful_events
+    assert [event[0] for event in stateful_events] == ["close"]
+
+
+@pytest.mark.parametrize("parse", [False, True])
+def test__runner__defers_file_with_other_inline_key(
+    tmp_path, monkeypatch, stateful_events, parse
+):
+    """A file whose inline config chooses another templater is deferred.
+
+    Files are grouped by their config without inline config, and each is
+    read only once. A file whose inline config chooses another key is
+    rendered after all groups, with a templater for that key, which is
+    released after its last file.
+    """
+    fnames = [
+        _stateful_file(tmp_path, "x", 0),
+        _stateful_file(tmp_path, "x", 1),
+        _stateful_file(tmp_path, "y", 2),
+        _stateful_file(tmp_path, "x", 3),
+    ]
+    for fname in (fnames[0], fnames[3]):
+        with open(fname, "w", encoding="utf-8") as inline_file:
+            inline_file.write("-- sqlfluff:templater:stateful:key:y\nselect 1\n")
+    reads = []
+    load_raw_file = Linter._load_raw_file
+
+    def record(fname, file_config):
+        reads.append(fname)
+        return load_raw_file(fname, file_config)
+
+    monkeypatch.setattr(Linter, "_load_raw_file", staticmethod(record))
+    keys = {}
+    process = StatefulTemplater.process
+
+    def record_key(self, *, in_str, fname, config=None, formatter=None):
+        keys[fname] = self.session_key(config)[1]
+        return process(
+            self, in_str=in_str, fname=fname, config=config, formatter=formatter
+        )
+
+    monkeypatch.setattr(StatefulTemplater, "process", record_key)
+    lntr = Linter(dialect="ansi")
+    if parse:
+        paths = [result.fname for result in lntr.parse_path(str(tmp_path))]
+    else:
+        paths = [
+            linted_file.path
+            for linted_file in runner.SequentialRunner(lntr, lntr.config).run(
+                fnames, fix=False
+            )
+        ]
+    # Each group's files are rendered in reverse, as sequenced, and then the
+    # deferred files, as sequenced again in the order they were deferred.
+    expected = [fnames[1], fnames[2], fnames[0], fnames[3]]
+    assert paths == expected
+    assert sorted(reads) == sorted(fnames)
+    x_templater = stateful_events[0][2]
+    y_templater = stateful_events[2][2]
+    deferred_templater = stateful_events[4][2]
+    assert stateful_events == [
+        ("render", fnames[1], x_templater),
+        ("close", x_templater),
+        ("render", fnames[2], y_templater),
+        ("close", y_templater),
+        ("render", fnames[0], deferred_templater),
+        ("render", fnames[3], deferred_templater),
+        ("close", deferred_templater),
+    ]
+    assert deferred_templater is not y_templater
+    assert keys == {fnames[0]: "y", fnames[1]: "x", fnames[2]: "y", fnames[3]: "y"}
 
 
 def test__parallel_runner__iter_partials_by_templater(tmp_path, stateful_events):
