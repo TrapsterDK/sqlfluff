@@ -75,8 +75,8 @@ def _selectable_by_nested_config(templater: RawTemplater) -> bool:
 
     Templaters which render in worker processes hold no state shared between
     files. Others can only be selected per directory if they say how their
-    state is shared, by overriding `session_key`. Otherwise (e.g. dbt) only
-    the root templater is used.
+    state is shared, by overriding `session_key`, as dbt does. Otherwise (e.g.
+    sqlmesh) only the root templater is used.
     """
     return templater.templates_in_worker or _shares_state_by_key(type(templater))
 
@@ -1125,8 +1125,8 @@ class Linter:
 
         A templater set by nested config files (see `_nested_core_value`) is
         used if both it and the root templater can be selected by nested
-        config (see `_selectable_by_nested_config`). Otherwise (e.g. dbt) the
-        root templater is used, and a warning logged unless `warn` is False.
+        config (see `_selectable_by_nested_config`). Otherwise (e.g. sqlmesh)
+        the root templater is used, and a warning logged unless `warn` is False.
         """
         file_templater: RawTemplater = config.get("templater_obj") or self.templater
         file_class = type(file_templater)
@@ -1146,10 +1146,10 @@ class Linter:
             reason = (
                 ""
                 if selectable
-                else "Templaters which cannot render in worker processes (e.g. dbt) "
-                "must be set in a .sqlfluff in the current working directory, and "
-                "cannot be set or replaced in a .sqlfluff file in a subdirectory "
-                "of it. "
+                else "Templaters which cannot render in worker processes, and "
+                "don't say how their state can be shared (e.g. sqlmesh), must be "
+                "set in a .sqlfluff in the current working directory, and cannot "
+                "be set or replaced in a .sqlfluff file in a subdirectory of it. "
             )
             linter_logger.warning(
                 f"Attempt to set templater to {file_templater.name} failed. "
@@ -1535,27 +1535,35 @@ class Linter:
         NB: This a generator which will yield the result of each file
         within the path iteratively.
         """
+        from sqlfluff.core.linter.runner import SequentialRunner
+
         sql_exts = self.config.get("sql_file_exts", default=".sql").lower().split(",")
-        with self._templater_session():
-            for fname in paths_from_path(
+        fnames = list(
+            paths_from_path(
                 path,
                 target_file_exts=sql_exts,
                 target_file_exts_for_path=self._file_extensions_for_path,
-            ):
-                if self.formatter:
-                    self.formatter.dispatch_path(path)
-                # Load the file with the config and yield the result.
-                try:
-                    raw_file, config, encoding = self.load_raw_file_and_config(
-                        fname, self.config
-                    )
-                except SQLFluffSkipFile as s:
-                    linter_logger.warning(str(s))
-                    continue
-                yield self.parse_string(
-                    raw_file,
-                    fname=fname,
-                    config=config,
-                    encoding=encoding,
-                    parse_statistics=parse_statistics,
-                )
+            )
+        )
+        # Files are grouped by templater as when linting, so that each
+        # templater which holds state (e.g. for a dbt project) is closed
+        # before the next loads its state.
+        parse_runner = SequentialRunner(self, self.config)
+        for prepared in parse_runner._iter_prepared(fnames, self.formatter):
+            if self.formatter:
+                self.formatter.dispatch_path(path)
+            if prepared.error:
+                raise prepared.error
+            # Load the file with the config and yield the result.
+            try:
+                raw_file, config, encoding = parse_runner._load(prepared)
+            except SQLFluffSkipFile as s:
+                linter_logger.warning(str(s))
+                continue
+            yield self.parse_string(
+                raw_file,
+                fname=prepared.fname,
+                config=config,
+                encoding=encoding,
+                parse_statistics=parse_statistics,
+            )

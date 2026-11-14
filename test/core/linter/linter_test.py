@@ -1574,7 +1574,9 @@ class StatefulTemplater(RawTemplater):
         return (self.name, str(config.get("key", section=("templater", self.name))))
 
     def sequence_files(self, fnames, config=None, formatter=None):
-        """Render files in reverse order."""
+        """Render files in reverse order, or fail for the "bad" key."""
+        if self.session_key(config)[1] == "bad":
+            raise SQLFluffUserError("bad key")
         return list(reversed(fnames))
 
     def process(self, *, in_str, fname, config=None, formatter=None):
@@ -1688,34 +1690,130 @@ def test__linter__ignores_nested_unkeyed_templater_once(tmp_path, stateful_event
 
 
 def test__sequential_runner__groups_files_by_templater(tmp_path, stateful_events):
-    """Each templater sequences its own files, which keep its places in order.
+    """Each templater sequences its own files.
 
-    Each templater is closed after its last file.
+    Templaters which render in worker processes keep their files' places in
+    discovery order. Others render their files together, from the place of
+    their first file, and are each closed after their last file, before the
+    next one starts.
     """
     fnames = [
         _stateful_file(tmp_path, key, index)
-        for index, key in enumerate(["x", None, "x", "y", None])
+        for index, key in enumerate(["x", None, "y", "x", None, "y"])
     ]
     lntr = Linter(dialect="ansi")
     linted = list(runner.SequentialRunner(lntr, lntr.config).run(fnames, fix=False))
 
-    # The "x" files are reversed, in the places of the "x" files.
+    # The "x" and "y" files are each reversed, from the place of their first.
     assert [linted_file.path for linted_file in linted] == [
-        fnames[2],
-        fnames[1],
-        fnames[0],
         fnames[3],
+        fnames[0],
+        fnames[1],
+        fnames[5],
+        fnames[2],
         fnames[4],
     ]
+    x_templater = stateful_events[0][2]
+    y_templater = stateful_events[3][2]
+    assert stateful_events == [
+        ("render", fnames[3], x_templater),
+        ("render", fnames[0], x_templater),
+        ("close", x_templater),
+        ("render", fnames[5], y_templater),
+        ("render", fnames[2], y_templater),
+        ("close", y_templater),
+    ]
+
+
+def _stateful_files_with_inline_key(tmp_path):
+    """Three files in a directory with key "x", the second set to "y" inline."""
+    fnames = [_stateful_file(tmp_path, "x", index) for index in range(3)]
+    with open(fnames[1], "w", encoding="utf-8") as inline_file:
+        inline_file.write("-- sqlfluff:templater:stateful:key:y\nselect 1\n")
+    return fnames
+
+
+def _assert_rendered_in_turn(stateful_events, fnames):
+    """The "x" files render first, then the file set to "y" inline."""
     x_templater = stateful_events[0][2]
     y_templater = stateful_events[3][2]
     assert stateful_events == [
         ("render", fnames[2], x_templater),
         ("render", fnames[0], x_templater),
         ("close", x_templater),
-        ("render", fnames[3], y_templater),
+        ("render", fnames[1], y_templater),
         ("close", y_templater),
     ]
+
+
+def test__sequential_runner__groups_files_by_inline_config(tmp_path, stateful_events):
+    """Files are grouped by the templater which their inline config selects."""
+    fnames = _stateful_files_with_inline_key(tmp_path)
+    lntr = Linter(dialect="ansi")
+    linted = list(runner.SequentialRunner(lntr, lntr.config).run(fnames, fix=False))
+    assert [linted_file.path for linted_file in linted] == [
+        fnames[2],
+        fnames[0],
+        fnames[1],
+    ]
+    _assert_rendered_in_turn(stateful_events, fnames)
+
+
+def test__linter__parse_path_groups_files_by_templater(tmp_path, stateful_events):
+    """Parsing a path renders each templater's files in turn, like linting."""
+    fnames = _stateful_files_with_inline_key(tmp_path)
+    lntr = Linter(dialect="ansi")
+    parsed = list(lntr.parse_path(str(tmp_path)))
+    assert [result.fname for result in parsed] == [fnames[2], fnames[0], fnames[1]]
+    _assert_rendered_in_turn(stateful_events, fnames)
+
+
+def test__sequential_runner__sequence_error_per_file(tmp_path, stateful_events):
+    """A templater which can't sequence its files fails only those files.
+
+    If it's the only templater, the error is raised.
+    """
+    fnames = [
+        _stateful_file(tmp_path, key, index)
+        for index, key in enumerate(["bad", "x", "bad"])
+    ]
+    lntr = Linter(dialect="ansi")
+    linted = {
+        linted_file.path: linted_file
+        for linted_file in runner.SequentialRunner(lntr, lntr.config).run(
+            fnames, fix=False
+        )
+    }
+    for fname in (fnames[0], fnames[2]):
+        (violation,) = linted[fname].violations
+        assert isinstance(violation, SQLTemplaterError)
+        assert violation.desc() == "bad key"
+    assert not linted[fnames[1]].violations
+
+    with pytest.raises(SQLFluffUserError, match="bad key"):
+        list(lntr.parse_path(str(tmp_path)))
+    with pytest.raises(SQLFluffUserError, match="bad key"):
+        list(
+            runner.SequentialRunner(lntr, lntr.config).run(
+                [fnames[0], fnames[2]], fix=False
+            )
+        )
+
+
+def test__sequential_runner__skips_file_loaded_to_choose_templater(
+    tmp_path, stateful_events
+):
+    """A file loaded to choose its templater may be skipped."""
+    fname = _stateful_file(tmp_path, "x")
+    (tmp_path / "x" / ".sqlfluff").write_text(
+        "[sqlfluff]\ntemplater = stateful\nlarge_file_skip_byte_limit = 1\n",
+        encoding="utf-8",
+    )
+    lntr = Linter(dialect="ansi")
+    sequential_runner = runner.SequentialRunner(lntr, lntr.config)
+    assert not list(sequential_runner.run([fname], fix=False))
+    assert sequential_runner.skipped_file_count == 1
+    assert not stateful_events
 
 
 def test__parallel_runner__iter_partials_by_templater(tmp_path, stateful_events):
